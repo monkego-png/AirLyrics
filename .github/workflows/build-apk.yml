@@ -1,23 +1,16 @@
-name: Apply Line-by-Line Lyrics Highlighting
+name: Build Debug APK
 
 on:
   workflow_dispatch:
     inputs:
       target_branch:
-        description: 'Branch to apply changes to and push'
+        description: 'Branch to build from'
         required: false
         default: 'main'
 
-permissions:
-  contents: write
-
-concurrency:
-  group: line-by-line-highlighting-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  update-codebase:
-    name: Apply Lyrics Highlighting Changes
+  build-apk:
+    name: Build AirLyrics APK
     runs-on: ubuntu-latest
 
     steps:
@@ -25,379 +18,39 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.target_branch || github.ref_name }}
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          python-version: '3.11'
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
 
-      # -----------------------------------------------------------------------
-      # 1. Update FloatingLyricsRenderer.kt
-      #    - Upgrades renderPlainTextAtIndex to apply line-by-line highlighting
-      #      to the active line (using plainLineSpan) across all content modes.
-      #    - Updates renderTextAtIndexWithWordByWord to fall back gracefully to
-      #      line-by-line highlighting when a specific line lacks word segments.
-      #    - Preserves wordByWordLineSpan for word-by-word timed lyrics files.
-      # -----------------------------------------------------------------------
-      - name: Update FloatingLyricsRenderer.kt
-        run: |
-          python3 - << 'EOF'
-          path = 'app/src/main/java/com/andsi/airlyrics/floating/FloatingLyricsRenderer.kt'
-          with open(path, 'r', encoding='utf-8') as f:
-              code = f.read()
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
 
-          old_render_plain = """    private fun renderPlainTextAtIndex(index: Int): CharSequence {
-                  return PlainLyricsDisplayFormatter.format(
-                      plainLines = currentPlainLines,
-                      currentIndex = index,
-                      contentMode = contentModeProvider(),
-                      lineMode = lineModeProvider(),
-                      noTranslationText = noTranslationTextProvider()
-                  )
-              }"""
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
 
-          new_render_plain = """    private fun renderPlainTextAtIndex(currentIndex: Int): CharSequence {
-                  if (currentPlainLines.isEmpty() || currentIndex !in currentPlainLines.indices) return ""
-                  val indexes = visiblePlainLineIndexes(currentIndex)
-                  if (indexes.isEmpty()) return ""
-                  val renderedLines = mutableListOf<CharSequence>()
-                  val contentMode = contentModeProvider()
-                  indexes.forEach { index ->
-                      val line = currentPlainLines[index]
-                      val original = line.text.trim()
-                      val translation = line.translation.orEmpty().trim()
-                      if (line.isMetadata) {
-                          if (original.isNotBlank()) renderedLines += original
-                          return@forEach
-                      }
-                      val isCurrent = index == currentIndex
-                      when (contentMode) {
-                          LyricsContentDisplayMode.ORIGINAL_WITH_TRANSLATION -> {
-                              val block = SpannableStringBuilder()
-                              if (original.isNotBlank()) {
-                                  block.append(if (isCurrent) plainLineSpan(original) else original)
-                              }
-                              if (line.hasTranslation()) {
-                                  if (block.isNotEmpty()) block.append('\\n')
-                                  block.append(translation)
-                              }
-                              if (block.isNotBlankText()) renderedLines += block
-                          }
-                          LyricsContentDisplayMode.ORIGINAL_ONLY -> {
-                              if (original.isNotBlank()) {
-                                  renderedLines += if (isCurrent) plainLineSpan(original) else original
-                              }
-                          }
-                          LyricsContentDisplayMode.TRANSLATION_ONLY -> {
-                              if (line.hasTranslation()) renderedLines += translation
-                          }
-                      }
-                  }
-                  if (renderedLines.isEmpty()) {
-                      return if (contentMode == LyricsContentDisplayMode.TRANSLATION_ONLY) {
-                          noTranslationTextProvider()
-                      } else {
-                          ""
-                      }
-                  }
-                  return SpannableStringBuilder().apply {
-                      renderedLines.forEachIndexed { renderedIndex, renderedLine ->
-                          if (renderedIndex > 0) append('\\n')
-                          append(renderedLine)
-                      }
-                  }
-              }
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
 
-              private fun plainLineSpan(displayText: String): CharSequence {
-                  val text = displayText.trim()
-                  if (text.isBlank()) return ""
-                  val span = SpannableString(text)
-                  val highlightColor = wordByWordHighlightColorProvider()
-                  span.setSpan(
-                      ForegroundColorSpan(highlightColor),
-                      0,
-                      text.length,
-                      Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                  )
-                  return span
-              }"""
+      - name: Link NDK for Gradle
+        run: echo "ndk.dir=${{ steps.setup-ndk.outputs.ndk-path }}" > local.properties
 
-          assert old_render_plain in code, "Target renderPlainTextAtIndex block not found"
-          code = code.replace(old_render_plain, new_render_plain, 1)
+      - name: Build Debug APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: ./gradlew assembleDebug
 
-          old_branch1 = """                    if (original.isNotBlank()) {
-                                  block.append(
-                                      if (wordByWordLine != null) wordByWordLineSpan(wordByWordLine, original, positionMs)
-                                      else original
-                                  )
-                              }"""
-          new_branch1 = """                    if (original.isNotBlank()) {
-                                  block.append(
-                                      if (wordByWordLine != null) wordByWordLineSpan(wordByWordLine, original, positionMs)
-                                      else if (isCurrent) plainLineSpan(original)
-                                      else original
-                                  )
-                              }"""
-
-          old_branch2 = """                LyricsContentDisplayMode.ORIGINAL_ONLY -> {
-                              if (original.isNotBlank()) {
-                                  renderedLines += if (wordByWordLine != null) {
-                                      wordByWordLineSpan(wordByWordLine, original, positionMs)
-                                  } else {
-                                      original
-                                  }
-                              }
-                          }"""
-          new_branch2 = """                LyricsContentDisplayMode.ORIGINAL_ONLY -> {
-                              if (original.isNotBlank()) {
-                                  renderedLines += if (wordByWordLine != null) {
-                                      wordByWordLineSpan(wordByWordLine, original, positionMs)
-                                  } else if (isCurrent) {
-                                      plainLineSpan(original)
-                                  } else {
-                                      original
-                                  }
-                              }
-                          }"""
-
-          assert old_branch1 in code, "Target original_with_translation branch not found"
-          code = code.replace(old_branch1, new_branch1, 1)
-
-          assert old_branch2 in code, "Target original_only branch not found"
-          code = code.replace(old_branch2, new_branch2, 1)
-
-          with open(path, 'w', encoding='utf-8') as f:
-              f.write(code)
-          print("Updated FloatingLyricsRenderer.kt successfully.")
-          EOF
-
-      # -----------------------------------------------------------------------
-      # 2. Update FloatingPageScope.kt
-      #    - Updates the floating settings preview card so previewLyricsText
-      #      highlights the current line in full when word-by-word is disabled.
-      # -----------------------------------------------------------------------
-      - name: Update FloatingPageScope.kt
-        run: |
-          python3 - << 'EOF'
-          path = 'app/src/main/java/com/andsi/airlyrics/ui/pages/floating/FloatingPageScope.kt'
-          with open(path, 'r', encoding='utf-8') as f:
-              code = f.read()
-
-          old_preview = """    internal fun previewLyricsText(previewStyle: FloatingLyricsStyle): CharSequence {
-                  return formattedPreviewLyrics(
-                      mode = contentDisplayMode(),
-                      lines = visiblePreviewLyricLines(),
-                      textColor = previewStyle.textColor
-                  )
-              }"""
-
-          new_preview = """    internal fun previewLyricsText(previewStyle: FloatingLyricsStyle): CharSequence {
-                  val currentLine = currentPreviewLyricLine()
-                  val visibleLines = visiblePreviewLyricLines()
-                  val result = SpannableStringBuilder(
-                      formattedPreviewLyrics(
-                          mode = contentDisplayMode(),
-                          lines = visibleLines,
-                          textColor = previewStyle.textColor
-                      )
-                  )
-                  if (contentDisplayMode() != LyricsContentDisplayMode.TRANSLATION_ONLY) {
-                      val currentLineStart = result.toString().indexOf(currentLine.original)
-                      if (currentLineStart >= 0) {
-                          result.setSpan(
-                              ForegroundColorSpan(
-                                  AirColorUtils.multiplyAlpha(
-                                      previewStyle.wordByWordHighlightColor,
-                                      Color.alpha(previewStyle.textColor)
-                                  )
-                              ),
-                              currentLineStart,
-                              currentLineStart + currentLine.original.length,
-                              Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                          )
-                      }
-                  }
-                  return result
-              }"""
-
-          assert old_preview in code, "Target previewLyricsText function not found"
-          code = code.replace(old_preview, new_preview, 1)
-
-          with open(path, 'w', encoding='utf-8') as f:
-              f.write(code)
-          print("Updated FloatingPageScope.kt successfully.")
-          EOF
-
-      # -----------------------------------------------------------------------
-      # 3. Update FloatingAnimationSection.kt
-      #    - Unifies the highlight color tile title and dialog panel title.
-      # -----------------------------------------------------------------------
-      - name: Update FloatingAnimationSection.kt
-        run: |
-          python3 - << 'EOF'
-          path = 'app/src/main/java/com/andsi/airlyrics/ui/pages/floating/sections/FloatingAnimationSection.kt'
-          with open(path, 'r', encoding='utf-8') as f:
-              code = f.read()
-
-          old_code = """                    openPanel(
-                                  tile,
-                                  getString(R.string.ui_word_by_word_color),"""
-
-          new_code = """                    openPanel(
-                                  tile,
-                                  getString(R.string.ui_highlight_color),"""
-
-          assert old_code in code, "Target openPanel call not found"
-          code = code.replace(old_code, new_code, 1)
-
-          with open(path, 'w', encoding='utf-8') as f:
-              f.write(code)
-          print("Updated FloatingAnimationSection.kt successfully.")
-          EOF
-
-      # -----------------------------------------------------------------------
-      # 4. Synchronize Android string resources across all 4 supported locales
-      #    - Enforces full localization compliance with check_localization.sh.
-      # -----------------------------------------------------------------------
-      - name: Update Android string resource files
-        run: |
-          python3 - << 'EOF'
-          res_files = {
-              'app/src/main/res/values/strings.xml': (
-                  '<string name="ui_line_by_line">Line</string>',
-                  '<string name="ui_line_by_line_highlight">Line-by-line highlight</string>'
-              ),
-              'app/src/main/res/values-es/strings.xml': (
-                  '<string name="ui_line_by_line">Línea</string>',
-                  '<string name="ui_line_by_line_highlight">Resaltado línea por línea</string>'
-              ),
-              'app/src/main/res/values-zh-rCN/strings.xml': (
-                  '<string name="ui_line_by_line">逐行</string>',
-                  '<string name="ui_line_by_line_highlight">逐行高亮</string>'
-              ),
-              'app/src/main/res/values-zh-rTW/strings.xml': (
-                  '<string name="ui_line_by_line">逐行</string>',
-                  '<string name="ui_line_by_line_highlight">逐行醒目提示</string>'
-              ),
-          }
-
-          for path, (s1, s2) in res_files.items():
-              with open(path, 'r', encoding='utf-8') as f:
-                  content = f.read()
-              if 'ui_line_by_line' not in content:
-                  content = content.replace('</resources>', f'    {s1}\n    {s2}\n</resources>', 1)
-                  with open(path, 'w', encoding='utf-8') as f:
-                      f.write(content)
-          print("Updated all locale strings.xml successfully.")
-          EOF
-
-      # -----------------------------------------------------------------------
-      # 5. Update unit tests in FloatingLyricsRendererTest.kt
-      # -----------------------------------------------------------------------
-      - name: Update FloatingLyricsRendererTest.kt
-        run: |
-          python3 - << 'EOF'
-          path = 'app/src/test/java/com/andsi/airlyrics/floating/FloatingLyricsRendererTest.kt'
-          with open(path, 'r', encoding='utf-8') as f:
-              code = f.read()
-
-          target = """    @Test
-              fun mismatchedWordByWordLine_fallsBackToUnhighlightedPlainLyrics() {
-                  val textView = TextView(context)
-                  val renderer = renderer(textView = textView, wordByWordEnabled = true)
-                  renderer.updatePlayback(positionMs = 1_500L, isPlaying = false)
-
-                  renderer.parseAndShow(
-                      plainLrc = "[00:01.00]Hello",
-                      wordByWordLines = listOf(timedLine("Unrelated words")),
-                      emptyText = "empty"
-                  )
-
-                  assertEquals("Hello", textView.text.toString())
-                  assertTrue(textView.text.highlightSpans().isEmpty())
-              }"""
-
-          replacement = """    @Test
-              fun mismatchedWordByWordLine_fallsBackToLineByLineHighlightedPlainLyrics() {
-                  val textView = TextView(context)
-                  val renderer = renderer(
-                      textView = textView,
-                      wordByWordEnabled = true,
-                      highlightColor = Color.MAGENTA
-                  )
-                  renderer.updatePlayback(positionMs = 1_500L, isPlaying = false)
-
-                  renderer.parseAndShow(
-                      plainLrc = "[00:01.00]Hello",
-                      wordByWordLines = listOf(timedLine("Unrelated words")),
-                      emptyText = "empty"
-                  )
-
-                  assertEquals("Hello", textView.text.toString())
-                  val text = textView.text as Spanned
-                  val highlightSpan = text.highlightSpans().first { it.foregroundColor == Color.MAGENTA }
-                  assertEquals(0, text.getSpanStart(highlightSpan))
-                  assertEquals("Hello".length, text.getSpanEnd(highlightSpan))
-              }
-
-              @Test
-              fun plainLyrics_highlightsOnlyCurrentLineAcrossMultipleLines() {
-                  val textView = TextView(context).apply { setTextColor(Color.WHITE) }
-                  val renderer = renderer(
-                      textView = textView,
-                      contentMode = LyricsContentDisplayMode.ORIGINAL_WITH_TRANSLATION,
-                      lineMode = LyricsLineDisplayMode.PREVIOUS_CURRENT_NEXT,
-                      highlightColor = Color.GREEN
-                  )
-                  renderer.parseAndShow(
-                      plainLrc = "[00:01.00]first\\n[00:02.00]second\\n[00:03.00]third",
-                      translatedLrc = "[00:01.00]第一句\\n[00:02.00]第二句\\n[00:03.00]第三句",
-                      emptyText = "empty"
-                  )
-                  renderer.updatePlayback(positionMs = 2_100L, isPlaying = false)
-                  renderer.tick()
-                  assertEquals("first\\n第一句\\nsecond\\n第二句\\nthird\\n第三句", textView.text.toString())
-                  val text = textView.text as Spanned
-                  val highlightSpans = text.highlightSpans().filter { it.foregroundColor == Color.GREEN }
-                  assertEquals(1, highlightSpans.size)
-                  val currentSpan = highlightSpans.first()
-                  val secondStart = text.indexOf("second")
-                  assertEquals(secondStart, text.getSpanStart(currentSpan))
-                  assertEquals(secondStart + "second".length, text.getSpanEnd(currentSpan))
-              }"""
-
-          assert target in code, "Target test method not found"
-          code = code.replace(target, replacement, 1)
-
-          with open(path, 'w', encoding='utf-8') as f:
-              f.write(code)
-          print("Updated FloatingLyricsRendererTest.kt successfully.")
-          EOF
-
-      # -----------------------------------------------------------------------
-      # 6. Verify Architecture and Localization Standards
-      # -----------------------------------------------------------------------
-      - name: Validate architecture and localization
-        run: |
-          chmod +x ./scripts/check_localization.sh ./scripts/check_architecture_boundaries.sh
-          ./scripts/check_localization.sh
-          ./scripts/check_architecture_boundaries.sh
-
-      # -----------------------------------------------------------------------
-      # 7. Commit and push directly to repository branch
-      # -----------------------------------------------------------------------
-      - name: Commit and push changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add -A
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "feat(floating): support line-by-line lyrics highlighting alongside word timing"
-            TARGET_REF="${{ github.event.inputs.target_branch || github.ref_name }}"
-            git push origin HEAD:"$TARGET_REF"
-          fi
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AirLyrics-Debug-APK
+          path: app/build/outputs/apk/de
+          bug/*.apk
