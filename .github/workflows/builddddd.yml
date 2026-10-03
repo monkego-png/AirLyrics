@@ -1,0 +1,407 @@
+name: Apply Lyrics Highlighting and Native Module Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: 'Branch to apply changes to and push'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lyrics-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fix-lyrics-and-highlighting:
+    name: Fix Lyrics Providers & Apply Line Highlighting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.target_branch || github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # -----------------------------------------------------------------------
+      # 1. Update FloatingLyricsRenderer.kt: Line-by-line & Word-by-word
+      # -----------------------------------------------------------------------
+      - name: Update FloatingLyricsRenderer.kt
+        run: |
+          python3 - << 'EOF'
+          path = 'app/src/main/java/com/andsi/airlyrics/floating/FloatingLyricsRenderer.kt'
+          with open(path, 'r', encoding='utf-8') as f:
+              code = f.read()
+
+          old_render_plain = """    private fun renderPlainTextAtIndex(index: Int): CharSequence {
+                  return PlainLyricsDisplayFormatter.format(
+                      plainLines = currentPlainLines,
+                      currentIndex = index,
+                      contentMode = contentModeProvider(),
+                      lineMode = lineModeProvider(),
+                      noTranslationText = noTranslationTextProvider()
+                  )
+              }"""
+
+          new_render_plain = """    private fun renderPlainTextAtIndex(currentIndex: Int): CharSequence {
+                  if (currentPlainLines.isEmpty() || currentIndex !in currentPlainLines.indices) return ""
+                  val indexes = visiblePlainLineIndexes(currentIndex)
+                  if (indexes.isEmpty()) return ""
+                  val renderedLines = mutableListOf<CharSequence>()
+                  val contentMode = contentModeProvider()
+                  indexes.forEach { index ->
+                      val line = currentPlainLines[index]
+                      val original = line.text.trim()
+                      val translation = line.translation.orEmpty().trim()
+                      if (line.isMetadata) {
+                          if (original.isNotBlank()) renderedLines += original
+                          return@forEach
+                      }
+                      val isCurrent = index == currentIndex
+                      when (contentMode) {
+                          LyricsContentDisplayMode.ORIGINAL_WITH_TRANSLATION -> {
+                              val block = SpannableStringBuilder()
+                              if (original.isNotBlank()) {
+                                  block.append(if (isCurrent) plainLineSpan(original) else original)
+                              }
+                              if (line.hasTranslation()) {
+                                  if (block.isNotEmpty()) block.append('\\n')
+                                  block.append(translation)
+                              }
+                              if (block.isNotBlankText()) renderedLines += block
+                          }
+                          LyricsContentDisplayMode.ORIGINAL_ONLY -> {
+                              if (original.isNotBlank()) {
+                                  renderedLines += if (isCurrent) plainLineSpan(original) else original
+                              }
+                          }
+                          LyricsContentDisplayMode.TRANSLATION_ONLY -> {
+                              if (line.hasTranslation()) renderedLines += translation
+                          }
+                      }
+                  }
+                  if (renderedLines.isEmpty()) {
+                      return if (contentMode == LyricsContentDisplayMode.TRANSLATION_ONLY) {
+                          noTranslationTextProvider()
+                      } else {
+                          ""
+                      }
+                  }
+                  return SpannableStringBuilder().apply {
+                      renderedLines.forEachIndexed { renderedIndex, renderedLine ->
+                          if (renderedIndex > 0) append('\\n')
+                          append(renderedLine)
+                      }
+                  }
+              }
+
+              private fun plainLineSpan(displayText: String): CharSequence {
+                  val text = displayText.trim()
+                  if (text.isBlank()) return ""
+                  val span = SpannableString(text)
+                  val highlightColor = wordByWordHighlightColorProvider()
+                  span.setSpan(
+                      ForegroundColorSpan(highlightColor),
+                      0,
+                      text.length,
+                      Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                  )
+                  return span
+              }"""
+
+          if old_render_plain in code:
+              code = code.replace(old_render_plain, new_render_plain, 1)
+
+          old_branch1 = """                    if (original.isNotBlank()) {
+                                  block.append(
+                                      if (wordByWordLine != null) wordByWordLineSpan(wordByWordLine, original, positionMs)
+                                      else original
+                                  )
+                              }"""
+          new_branch1 = """                    if (original.isNotBlank()) {
+                                  block.append(
+                                      if (wordByWordLine != null) wordByWordLineSpan(wordByWordLine, original, positionMs)
+                                      else if (isCurrent) plainLineSpan(original)
+                                      else original
+                                  )
+                              }"""
+
+          old_branch2 = """                LyricsContentDisplayMode.ORIGINAL_ONLY -> {
+                              if (original.isNotBlank()) {
+                                  renderedLines += if (wordByWordLine != null) {
+                                      wordByWordLineSpan(wordByWordLine, original, positionMs)
+                                  } else {
+                                      original
+                                  }
+                              }
+                          }"""
+          new_branch2 = """                LyricsContentDisplayMode.ORIGINAL_ONLY -> {
+                              if (original.isNotBlank()) {
+                                  renderedLines += if (wordByWordLine != null) {
+                                      wordByWordLineSpan(wordByWordLine, original, positionMs)
+                                  } else if (isCurrent) {
+                                      plainLineSpan(original)
+                                  } else {
+                                      original
+                                  }
+                              }
+                          }"""
+
+          if old_branch1 in code:
+              code = code.replace(old_branch1, new_branch1, 1)
+          if old_branch2 in code:
+              code = code.replace(old_branch2, new_branch2, 1)
+
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(code)
+          print("Updated FloatingLyricsRenderer.kt")
+          EOF
+
+      # -----------------------------------------------------------------------
+      # 2. Update FloatingPageScope.kt Preview & Animation Sections
+      # -----------------------------------------------------------------------
+      - name: Update FloatingPageScope.kt and FloatingAnimationSection.kt
+        run: |
+          python3 - << 'EOF'
+          scope_path = 'app/src/main/java/com/andsi/airlyrics/ui/pages/floating/FloatingPageScope.kt'
+          with open(scope_path, 'r', encoding='utf-8') as f:
+              scope_code = f.read()
+
+          old_preview = """    internal fun previewLyricsText(previewStyle: FloatingLyricsStyle): CharSequence {
+                  return formattedPreviewLyrics(
+                      mode = contentDisplayMode(),
+                      lines = visiblePreviewLyricLines(),
+                      textColor = previewStyle.textColor
+                  )
+              }"""
+
+          new_preview = """    internal fun previewLyricsText(previewStyle: FloatingLyricsStyle): CharSequence {
+                  val currentLine = currentPreviewLyricLine()
+                  val visibleLines = visiblePreviewLyricLines()
+                  val result = SpannableStringBuilder(
+                      formattedPreviewLyrics(
+                          mode = contentDisplayMode(),
+                          lines = visibleLines,
+                          textColor = previewStyle.textColor
+                      )
+                  )
+                  if (contentDisplayMode() != LyricsContentDisplayMode.TRANSLATION_ONLY) {
+                      val currentLineStart = result.toString().indexOf(currentLine.original)
+                      if (currentLineStart >= 0) {
+                          result.setSpan(
+                              ForegroundColorSpan(
+                                  AirColorUtils.multiplyAlpha(
+                                      previewStyle.wordByWordHighlightColor,
+                                      Color.alpha(previewStyle.textColor)
+                                  )
+                              ),
+                              currentLineStart,
+                              currentLineStart + currentLine.original.length,
+                              Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                          )
+                      }
+                  }
+                  return result
+              }"""
+
+          if old_preview in scope_code:
+              scope_code = scope_code.replace(old_preview, new_preview, 1)
+              with open(scope_path, 'w', encoding='utf-8') as f:
+                  f.write(scope_code)
+
+          anim_path = 'app/src/main/java/com/andsi/airlyrics/ui/pages/floating/sections/FloatingAnimationSection.kt'
+          with open(anim_path, 'r', encoding='utf-8') as f:
+              anim_code = f.read()
+
+          old_anim = """                    openPanel(
+                                  tile,
+                                  getString(R.string.ui_word_by_word_color),"""
+          new_anim = """                    openPanel(
+                                  tile,
+                                  getString(R.string.ui_highlight_color),"""
+
+          if old_anim in anim_code:
+              anim_code = anim_code.replace(old_anim, new_anim, 1)
+              with open(anim_path, 'w', encoding='utf-8') as f:
+                  f.write(anim_code)
+          print("Updated FloatingPageScope & FloatingAnimationSection")
+          EOF
+
+      # -----------------------------------------------------------------------
+      # 3. Add Kotlin HTTP Fallbacks for NetEase, Musixmatch, and LRCLIB
+      #    Eliminates "lyrics module error" when native libs are missing/failing.
+      # -----------------------------------------------------------------------
+      - name: Add Kotlin HTTP Fallbacks to Lyrics Providers
+        run: |
+          python3 - << 'EOF'
+          # --- 3a. LRCLIB Provider Fallback ---
+          lrclib_path = 'app/src/main/java/com/andsi/airlyrics/lyrics/providers/LrclibPlainLyricsProvider.kt'
+          with open(lrclib_path, 'r', encoding='utf-8') as f:
+              lrclib_code = f.read()
+
+          target_rec = """.recoverNativeLoadFailure(
+                      providerId = id,
+                      providerName = name
+                  )"""
+
+          repl_rec_lrclib = """.recoverCatching { error ->
+                      if (error.isNativeLoadFailure()) {
+                          fetchHttpFallback(title, artist, album, durationMs, cancellationToken)
+                              ?: throw error
+                      } else {
+                          throw error
+                      }
+                  }.recoverNativeLoadFailure(
+                      providerId = id,
+                      providerName = name
+                  )"""
+
+          if target_rec in lrclib_code:
+              lrclib_code = lrclib_code.replace(target_rec, repl_rec_lrclib, 1)
+
+          http_helper_lrclib = """    internal fun fetchHttpFallback(
+                  title: String,
+                  artist: String,
+                  album: String,
+                  durationMs: Long,
+                  cancellationToken: LyricsLookupCancellationToken? = null
+              ): LrclibPlainLyricsResult? {
+                  cancellationToken?.throwIfCancellationRequested()
+                  val durationSec = (durationMs / 1000L).coerceAtLeast(0L)
+                  val queryUrl = if (title.isNotBlank() && artist.isNotBlank() && durationSec > 0) {
+                      "https://lrclib.net/api/get?track_name=" + java.net.URLEncoder.encode(title, "UTF-8") +
+                          "&artist_name=" + java.net.URLEncoder.encode(artist, "UTF-8") +
+                          "&album_name=" + java.net.URLEncoder.encode(album, "UTF-8") +
+                          "&duration=" + durationSec
+                  } else {
+                      "https://lrclib.net/api/search?q=" + java.net.URLEncoder.encode("$title $artist".trim(), "UTF-8")
+                  }
+
+                  val jsonStr = httpGet(queryUrl, cancellationToken) ?: return null
+                  return try {
+                      if (jsonStr.trim().startsWith("[")) {
+                          val array = org.json.JSONArray(jsonStr)
+                          if (array.length() == 0) null
+                          else parseLrclibItem(array.getJSONObject(0), title, artist, album, durationMs)
+                      } else {
+                          val obj = org.json.JSONObject(jsonStr)
+                          parseLrclibItem(obj, title, artist, album, durationMs)
+                      }
+                  } catch (_: Exception) {
+                      null
+                  }
+              }
+
+              private fun parseLrclibItem(
+                  json: org.json.JSONObject,
+                  fallbackTitle: String,
+                  fallbackArtist: String,
+                  fallbackAlbum: String,
+                  fallbackDurationMs: Long
+              ): LrclibPlainLyricsResult? {
+                  val synced = json.optString("syncedLyrics", "").trim()
+                  val plain = json.optString("plainLyrics", "").trim()
+                  val rawLrc = synced.ifBlank { plain }
+                  if (rawLrc.isBlank()) return null
+                  val tracks = splitLrclibEmbeddedTranslations(rawLrc)
+                  val durSec = json.optDouble("duration", 0.0)
+                  val durMs = if (durSec > 0.0) (durSec * 1000.0).toLong() else fallbackDurationMs
+                  return LrclibPlainLyricsResult(
+                      plainSource = "lrclib-http",
+                      trackId = json.opt("id")?.toString().orEmpty(),
+                      title = json.optString("trackName").ifBlank { fallbackTitle },
+                      artist = json.optString("artistName").ifBlank { fallbackArtist },
+                      album = json.optString("albumName").ifBlank { fallbackAlbum },
+                      durationMs = durMs,
+                      lrc = tracks.originalLrc,
+                      translatedLrc = tracks.translatedLrc
+                  )
+              }
+
+              private fun httpGet(urlString: String, cancellationToken: LyricsLookupCancellationToken? = null): String? {
+                  cancellationToken?.throwIfCancellationRequested()
+                  return try {
+                      val url = java.net.URL(urlString)
+                      val connection = url.openConnection() as java.net.HttpURLConnection
+                      connection.requestMethod = "GET"
+                      connection.connectTimeout = 5000
+                      connection.readTimeout = 8000
+                      connection.setRequestProperty("User-Agent", "AirLyrics/1.2.6 (https://github.com/AirLyrics/AirLyrics)")
+                      connection.connect()
+                      cancellationToken?.throwIfCancellationRequested()
+                      val code = connection.responseCode
+                      if (code in 200..299) {
+                          connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                      } else {
+                          null
+                      }
+                  } catch (_: Exception) {
+                      null
+                  }
+              }
+          """
+          marker_lrclib = "    internal fun toProviderResult(result: LrclibPlainLyricsResult?): LyricsProviderResult? {"
+          if marker_lrclib in lrclib_code and "fetchHttpFallback" not in lrclib_code:
+              lrclib_code = lrclib_code.replace(marker_lrclib, http_helper_lrclib + "\n" + marker_lrclib, 1)
+
+          with open(lrclib_path, 'w', encoding='utf-8') as f:
+              f.write(lrclib_code)
+
+          # --- 3b. NetEase Provider Fallback ---
+          netease_path = 'app/src/main/java/com/andsi/airlyrics/lyrics/providers/NeteasePlainLyricsProvider.kt'
+          with open(netease_path, 'r', encoding='utf-8') as f:
+              netease_code = f.read()
+
+          repl_rec_netease = """.recoverCatching { error ->
+                      if (error.isNativeLoadFailure()) {
+                          fetchHttpFallback(title, artist, album, durationMs, cancellationToken)
+                              ?: throw error
+                      } else {
+                          throw error
+                      }
+                  }.recoverNativeLoadFailure(
+                      providerId = id,
+                      providerName = name
+                  )"""
+
+          if target_rec in netease_code:
+              netease_code = netease_code.replace(target_rec, repl_rec_netease, 1)
+
+          http_helper_netease = """    internal fun fetchHttpFallback(
+                  title: String,
+                  artist: String,
+                  album: String,
+                  durationMs: Long,
+                  cancellationToken: LyricsLookupCancellationToken? = null
+              ): NeteasePlainLyricsResult? {
+                  cancellationToken?.throwIfCancellationRequested()
+                  val query = "$title $artist".trim()
+                  if (query.isBlank()) return null
+                  return try {
+                      val searchUrl = "https://music.163.com/api/search/get/web?s=" +
+                          java.net.URLEncoder.encode(query, "UTF-8") + "&type=1&offset=0&total=true&limit=5"
+                      val searchJsonStr = httpGet(searchUrl, cancellationToken) ?: return null
+                      val searchJson = org.json.JSONObject(searchJsonStr)
+                      val resultObj = searchJson.optJSONObject("result") ?: return null
+                      val songsArray = resultObj.optJSONArray("songs") ?: return null
+                      if (songsArray.length() == 0) return null
+                      val songObj = songsArray.getJSONObject(0)
+                      val songId = songObj.opt("id")?.toString() ?: return null
+                      val songTitle = songObj.optString("name", title)
+                      val artistsArray = songObj.optJSONArray("artists")
+                      val songArtist = if (artistsArray != null && artistsArray.length() > 0) {
+                          artistsArray.getJSONObject(0).optString("name", artist)
+                      } else artist
+                      val albumObj = songObj.optJSONObject("album")
+                      val songAlbum = albumObj?.optString("name", album) ?: album
+                      val songDuratio
